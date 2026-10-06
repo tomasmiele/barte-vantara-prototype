@@ -14,12 +14,12 @@ import csv
 import re
 import unicodedata
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from itertools import combinations
 from pathlib import Path
-from typing import Callable
 
 
 @dataclass(frozen=True)
@@ -134,7 +134,7 @@ def name_in_history(name: str, history: str) -> bool:
     bank = name_tokens(history)
     if len(customer) < 2 or len(bank) < 2:
         return False
-    return bool(set(zip(customer, customer[1:])) & set(zip(bank, bank[1:])))
+    return bool(set(zip(customer, customer[1:])) & set(zip(bank, bank[1:])))  # noqa: RUF007
 
 
 def normalize_tax_id(value: str) -> str:
