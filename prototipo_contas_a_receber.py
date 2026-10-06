@@ -1,6 +1,8 @@
 """Concilia títulos dos arquivos 01/02 com créditos do extrato 03.
 
-Primeiro usa nosso_numero = documento; depois procura nomes em historico.
+Consolida títulos repetidos em 01/02 por CNPJ, vencimento e valor.
+Títulos distintos do mesmo CNPJ e vencimento são classificados em conjunto.
+Depois usa nosso_numero = documento e procura nomes em historico.
 Os arquivos de entrada são abertos apenas para leitura.
 """
 
@@ -133,11 +135,22 @@ def name_in_history(name: str, history: str) -> bool:
     return bool(set(zip(customer, customer[1:])) & set(zip(bank, bank[1:])))
 
 
-def reconcile(directory: Path) -> dict[str, list[str]]:
+def normalize_tax_id(value: str) -> str:
+    digits = re.sub(r"\D", "", value)
+    return digits if len(digits) == 14 else ""
+
+
+def reconcile(
+    directory: Path, category_counts: Counter[str] | None = None
+) -> dict[str, list[str]]:
+    if category_counts is None:
+        category_counts = Counter()
     paths = [input_file(directory, prefix) for prefix in ("01", "02", "03")]
     source_01, source_02, bank = (csv_rows(path) for path in paths)
-    require_columns(paths[0], {"cliente", "nosso_numero", "vencimento", "valor"})
-    require_columns(paths[1], {"customer_name", "due_date", "amount"})
+    require_columns(
+        paths[0], {"cliente", "cnpj", "nosso_numero", "vencimento", "valor"}
+    )
+    require_columns(paths[1], {"customer_name", "tax_id", "due_date", "amount"})
     require_columns(paths[2], {"documento", "historico", "tipo", "data", "valor"})
 
     credits: dict[str, list[Row]] = defaultdict(list)
@@ -147,71 +160,181 @@ def reconcile(directory: Path) -> dict[str, list[str]]:
             credits[document].append(row)
 
     sources = source_01 + source_02
-    key_counts = Counter(row.fields.get("nosso_numero", "") for row in sources)
     results: dict[str, list[str]] = defaultdict(list)
-    labels: list[str] = []
+    references: list[list[str]] = []
     names: list[str] = []
+    name_aliases: list[list[str]] = []
+    tax_ids: list[str] = []
     expected_values: list[Decimal] = []
     due_dates: list[date] = []
     for row in sources:
         is_01 = row.source == paths[0].name
-        number = row.fields.get("nosso_numero", "")
         expected = money(row.fields["valor"] if is_01 else row.fields["amount"])
         due = parse_date(row.fields["vencimento"] if is_01 else row.fields["due_date"])
-        display_number = (number.lstrip("0") or "0") if number else "ausente"
-        labels.append(
-            f"{'01' if is_01 else '02'}:{row.line} | nosso_numero={display_number} "
-            f"| valor={brl(expected)} | vencimento={due:%d/%m/%Y}"
-        )
-        names.append(row.fields["cliente" if is_01 else "customer_name"])
+        name = row.fields["cliente" if is_01 else "customer_name"]
+        references.append([f"{'01' if is_01 else '02'}:{row.line}"])
+        names.append(name)
+        name_aliases.append([name])
+        tax_ids.append(normalize_tax_id(row.fields["cnpj" if is_01 else "tax_id"]))
         expected_values.append(expected)
         due_dates.append(due)
 
-    def classify(index: int, matches: list[tuple[Row, Decimal]], method: str) -> None:
+    # Match rows across 01 and 02 one-to-one, so one receivable is reported once.
+    source_01_by_signature: dict[tuple[str, date, Decimal], list[int]] = defaultdict(
+        list
+    )
+    for index in range(len(source_01)):
+        if tax_ids[index]:
+            source_01_by_signature[
+                (tax_ids[index], due_dates[index], expected_values[index])
+            ].append(index)
+    duplicates: set[int] = set()
+    for index in range(len(source_01), len(sources)):
+        if not tax_ids[index]:
+            continue
+        signature = (tax_ids[index], due_dates[index], expected_values[index])
+        matching_01 = source_01_by_signature[signature]
+        if matching_01:
+            primary = matching_01.pop(0)
+            duplicates.add(index)
+            references[primary].extend(references[index])
+            name_aliases[primary].append(names[index])
+
+    active_indices = [index for index in range(len(sources)) if index not in duplicates]
+    key_counts = Counter(
+        sources[index].fields.get("nosso_numero", "") for index in active_indices
+    )
+    repeated_keys = sorted(
+        number for number, count in key_counts.items() if number and count > 1
+    )
+    if repeated_keys:
+        raise ValueError(
+            "nosso_numero repetido após consolidar 01/02: " + ", ".join(repeated_keys)
+        )
+    labels: list[str] = []
+    for index, row in enumerate(sources):
+        number = row.fields.get("nosso_numero", "")
+        display_number = (number.lstrip("0") or "0") if number else "ausente"
+        labels.append(
+            f"{' + '.join(references[index])} | nosso_numero={display_number} "
+            f"| valor={brl(expected_values[index])} "
+            f"| vencimento={due_dates[index]:%d/%m/%Y}"
+        )
+
+    same_company_due: dict[tuple[str, date], list[int]] = defaultdict(list)
+    for index in active_indices:
+        if tax_ids[index]:
+            same_company_due[(tax_ids[index], due_dates[index])].append(index)
+    distinct_cross_groups: dict[tuple[str, date], list[int]] = {}
+    for (tax_id, due), indices in same_company_due.items():
+        source_refs = [
+            reference for index in indices for reference in references[index]
+        ]
+        if (
+            any(reference.startswith("01:") for reference in source_refs)
+            and any(reference.startswith("02:") for reference in source_refs)
+            and len({expected_values[index] for index in indices}) > 1
+        ):
+            distinct_cross_groups[(tax_id, due)] = indices
+
+    def group_label(indices: list[int]) -> str:
+        expected = sum((expected_values[index] for index in indices), Decimal("0.00"))
+        due = due_dates[indices[0]]
+        source_refs = [
+            reference for index in indices for reference in references[index]
+        ]
+        return (
+            f"{' + '.join(source_refs)} | cnpj={tax_ids[indices[0]]} "
+            f"| valor={brl(expected)} | vencimento={due:%d/%m/%Y}"
+        )
+
+    def classify(
+        indices: list[int], matches: list[tuple[Row, Decimal]], methods: list[str]
+    ) -> None:
+        expected = sum((expected_values[index] for index in indices), Decimal("0.00"))
+        due = due_dates[indices[0]]
+        label = labels[indices[0]] if len(indices) == 1 else group_label(indices)
         paid = sum((amount for _, amount in matches), Decimal("0.00"))
         last_payment = max(parse_date(item.fields["data"]) for item, _ in matches)
-        bank_lines = ", ".join(str(item.line) for item, _ in matches)
+        bank_lines = ", ".join(dict.fromkeys(str(item.line) for item, _ in matches))
+        method = " + ".join(dict.fromkeys(methods))
         detail = (
-            f"{labels[index]} | recebido={brl(paid)} | data={last_payment:%d/%m/%Y} "
+            f"{label} | recebido={brl(paid)} | data={last_payment:%d/%m/%Y} "
             f"| linha do extrato={bank_lines} | critério={method}"
         )
-        if method == "nome":
-            detail += f" | cliente={names[index]}"
-        expected = expected_values[index]
-        due = due_dates[index]
+        if len(indices) == 1 and "nome" in methods:
+            detail += f" | cliente={names[indices[0]]}"
         if paid < expected:
-            results["PAGAMENTO INCOMPLETO"].append(
-                f"{detail} | faltam={brl(expected - paid)}"
-                + (" | crédito após vencimento" if last_payment > due else "")
+            category = "PAGAMENTO INCOMPLETO"
+            description = f"{detail} | faltam={brl(expected - paid)}" + (
+                " | crédito após vencimento" if last_payment > due else ""
             )
         elif paid > expected:
-            results["VALOR RECEBIDO MAIOR QUE O TÍTULO"].append(
-                f"{detail} | excedente={brl(paid - expected)}"
-            )
+            category = "VALOR RECEBIDO MAIOR QUE O TÍTULO"
+            description = f"{detail} | excedente={brl(paid - expected)}"
         elif last_payment > due:
-            results["PAGAMENTO ATRASADO"].append(detail)
+            category = "PAGAMENTO ATRASADO"
+            description = detail
         else:
-            results["PAGAMENTO EM DIA"].append(detail)
+            category = "PAGAMENTO EM DIA"
+            description = detail
+        results[category].append(description)
+        category_counts[category] += len(indices)
 
     unresolved: list[int] = []
     used_bank_lines: set[int] = set()
-    for index, row in enumerate(sources):
+    classified_by_key: set[int] = set()
+    matched_payments: dict[int, list[tuple[Row, Decimal]]] = defaultdict(list)
+    match_methods: dict[int, list[str]] = defaultdict(list)
+
+    def record_match(
+        index: int, matches: list[tuple[Row, Decimal]], method: str
+    ) -> None:
+        matched_payments[index].extend(matches)
+        match_methods[index].append(method)
+
+    for index in active_indices:
+        if index in classified_by_key:
+            continue
+        row = sources[index]
         number = row.fields.get("nosso_numero", "")
         if not number:
             unresolved.append(index)
-            continue
-        if key_counts[number] > 1:
-            results["CHAVE DUPLICADA NA ORIGEM"].append(labels[index])
             continue
         matched = credits.get(number, [])
         if not matched:
             unresolved.append(index)
             continue
-        classify(
+        group = distinct_cross_groups.get((tax_ids[index], due_dates[index]), [])
+        if len(matched) == 1 and len(group) > 1:
+            combined = sum(
+                (expected_values[sibling] for sibling in group), Decimal("0.00")
+            )
+            other_keyed_credits = any(
+                credits.get(sources[sibling].fields.get("nosso_numero", ""))
+                for sibling in group
+                if sibling != index
+            )
+            if (
+                money(matched[0].fields["valor"]) == combined
+                and not other_keyed_credits
+                and all(sibling not in classified_by_key for sibling in group)
+            ):
+                for sibling in group:
+                    record_match(
+                        sibling,
+                        [(matched[0], expected_values[sibling])],
+                        "nosso_numero + grupo CNPJ/vencimento",
+                    )
+                classified_by_key.update(group)
+                used_bank_lines.add(matched[0].line)
+                continue
+        record_match(
             index,
             [(item, money(item.fields["valor"])) for item in matched],
             "nosso_numero",
         )
+        classified_by_key.add(index)
         used_bank_lines.update(item.line for item in matched)
 
     available = [
@@ -223,11 +346,25 @@ def reconcile(directory: Path) -> dict[str, list[str]]:
     allocations: dict[int, list[tuple[Row, Decimal]]] = defaultdict(list)
 
     def name_candidates(credit: Row) -> list[int]:
-        return [
+        direct = {
             index
             for index in pending
-            if name_in_history(names[index], credit.fields["historico"])
-        ]
+            if any(
+                name_in_history(alias, credit.fields["historico"])
+                for alias in name_aliases[index]
+            )
+        }
+        # Different-value titles with the same CNPJ and due date remain
+        # separate, but may share one bank deposit equal to their sum.
+        candidates = set(direct)
+        for index in direct:
+            if tax_ids[index]:
+                candidates.update(
+                    sibling
+                    for sibling in same_company_due[(tax_ids[index], due_dates[index])]
+                    if sibling in pending
+                )
+        return sorted(candidates)
 
     # Prefer a unique title with exactly the same value.
     for credit in available:
@@ -279,11 +416,27 @@ def reconcile(directory: Path) -> dict[str, list[str]]:
 
     for index in unresolved:
         if allocations[index]:
-            classify(index, allocations[index], "nome")
-        elif sources[index].fields.get("nosso_numero", ""):
-            results["PAGAMENTO NÃO LOCALIZADO"].append(labels[index])
+            record_match(index, allocations[index], "nome")
+
+    grouped_indices: set[int] = set()
+    for indices in distinct_cross_groups.values():
+        matches = [match for index in indices for match in matched_payments[index]]
+        methods = [method for index in indices for method in match_methods[index]]
+        if matches:
+            classify(indices, matches, methods)
         else:
-            results["SEM CHAVE E SEM CORRESPONDÊNCIA POR NOME"].append(labels[index])
+            results["PAGAMENTO NÃO LOCALIZADO"].append(group_label(indices))
+            category_counts["PAGAMENTO NÃO LOCALIZADO"] += len(indices)
+        grouped_indices.update(indices)
+
+    for index in active_indices:
+        if index in grouped_indices:
+            continue
+        if matched_payments[index]:
+            classify([index], matched_payments[index], match_methods[index])
+        else:
+            results["PAGAMENTO NÃO LOCALIZADO"].append(labels[index])
+            category_counts["PAGAMENTO NÃO LOCALIZADO"] += 1
     return results
 
 
@@ -296,20 +449,21 @@ def main() -> None:
         "PAGAMENTO ATRASADO",
         "PAGAMENTO INCOMPLETO",
         "PAGAMENTO NÃO LOCALIZADO",
-        "SEM CHAVE E SEM CORRESPONDÊNCIA POR NOME",
-        "CHAVE DUPLICADA NA ORIGEM",
         "VALOR RECEBIDO MAIOR QUE O TÍTULO",
     )
+    category_counts: Counter[str] = Counter()
     try:
-        results = reconcile(args.data_dir)
+        results = reconcile(args.data_dir, category_counts)
     except (OSError, ValueError) as exc:
         parser.exit(1, f"Erro: {exc}\n")
     print(
-        "Regras: nosso_numero = documento; depois cliente = historico. Apenas tipo C."
+        "01/02: mesmo CNPJ, vencimento e valor = um título; "
+        "mesmo CNPJ/vencimento com valores diferentes = grupo."
     )
+    print("03: nosso_numero = documento; depois cliente = historico. Apenas tipo C.")
     for category in categories:
         items = results[category]
-        print(f"\n{category} ({len(items)})")
+        print(f"\n{category} ({category_counts[category]})")
         for item in items:
             print(f"  - {item}")
 
