@@ -86,3 +86,11 @@ PAGAMENTO MAIOR ATRASADO (1)
 - A busca final apenas por valor é conservadora: considera correspondências únicas de valor igual ou parcial entre créditos sem identificação e títulos ainda não encontrados. Ela não comprova a identidade do pagador e não cobre todos os casos ambíguos ou de valor excedente.
 - Para pagamentos com mais de um crédito associado, a classificação de prazo usa a **data do último crédito**. Valores recebidos a menor ou a maior são mostrados sem ajuste automático, cobrança ou devolução.
 - O programa não oferece interface gráfica, API, integração bancária nem exportação do relatório. Revisão humana continua necessária, especialmente para os `POSSÍVEL PAGAMENTO` e títulos não localizados.
+
+## Protótipo de contas a pagar: preparação dos e-mails
+
+Execute `python3 prototipo_contas_a_pagar.py` na raiz do projeto. O programa lê o único arquivo `04*.txt` em `data/` e cria `data/emails_contas_a_pagar.csv`, com as colunas `company,date`. Para usar outra pasta, passe `--data-dir "/caminho/para/o/data-pack"`; para escolher outro destino, passe `--output "/caminho/arquivo.csv"`.
+
+Cada bloco iniciado por `--- E-MAIL n ---` corresponde a um e-mail. O programa lê os campos `De` e `Data` do cabeçalho, ignora o trecho de WhatsApp, agrupa pelo domínio completo do remetente e ordena cada grupo pela data mais antiga. A coluna `company` contém a parte inicial do domínio: `financeiro@embalagenssaojorge.com.br` gera `embalagenssaojorge`. A data é gravada como `AAAA-MM-DD`.
+
+Esta etapa organiza os e-mails; a conciliação com os débitos (`tipo=D`) do extrato 03 ainda não está implementada. A pasta `data/` está no `.gitignore`, inclusive o CSV gerado.
