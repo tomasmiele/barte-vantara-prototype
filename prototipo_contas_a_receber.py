@@ -2,7 +2,7 @@
 
 Consolida títulos repetidos em 01/02 por CNPJ, vencimento e valor.
 Títulos distintos do mesmo CNPJ e vencimento são classificados em conjunto.
-Depois usa nosso_numero = documento e procura nomes em historico.
+Depois usa nosso_numero, nome e CNPJ/tax_id para procurar créditos no extrato.
 Os arquivos de entrada são abertos apenas para leitura.
 """
 
@@ -18,6 +18,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from itertools import combinations
 from pathlib import Path
+from typing import Callable
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,17 @@ def name_in_history(name: str, history: str) -> bool:
 def normalize_tax_id(value: str) -> str:
     digits = re.sub(r"\D", "", value)
     return digits if len(digits) == 14 else ""
+
+
+def tax_id_in_history(tax_id: str, history: str) -> bool:
+    """Find an entire 14-digit CNPJ, with or without punctuation, in historico."""
+    if not tax_id:
+        return False
+    pattern = r"(?<!\d)(?:\d[\s./-]*){13}\d(?!\d)"
+    return any(
+        normalize_tax_id(match.group()) == tax_id
+        for match in re.finditer(pattern, history)
+    )
 
 
 def reconcile(
@@ -264,6 +276,8 @@ def reconcile(
         )
         if len(indices) == 1 and "nome" in methods:
             detail += f" | cliente={names[indices[0]]}"
+        if len(indices) == 1 and "cnpj/tax_id" in methods:
+            detail += f" | cnpj={tax_ids[indices[0]]}"
         if paid < expected:
             category = "PAGAMENTO INCOMPLETO"
             description = f"{detail} | faltam={brl(expected - paid)}" + (
@@ -366,57 +380,81 @@ def reconcile(
                 )
         return sorted(candidates)
 
-    # Prefer a unique title with exactly the same value.
-    for credit in available:
-        amount = money(credit.fields["valor"])
-        exact = [
-            index
-            for index in name_candidates(credit)
-            if expected_values[index] == amount
-        ]
-        if len(exact) == 1:
-            index = exact[0]
-            allocations[index].append((credit, amount))
-            pending.remove(index)
-            used_bank_lines.add(credit.line)
+    def allocate_candidates(
+        candidate_rows: Callable[[Row], list[int]],
+        pending_rows: set[int],
+        found: dict[int, list[tuple[Row, Decimal]]],
+    ) -> None:
+        # Prefer a unique title with exactly the same value.
+        for credit in available:
+            if credit.line in used_bank_lines:
+                continue
+            amount = money(credit.fields["valor"])
+            exact = [
+                index
+                for index in candidate_rows(credit)
+                if expected_values[index] == amount
+            ]
+            if len(exact) == 1:
+                index = exact[0]
+                found[index].append((credit, amount))
+                pending_rows.remove(index)
+                used_bank_lines.add(credit.line)
 
-    # One deposit may combine several titles of the same customer.
-    for credit in available:
-        if credit.line in used_bank_lines:
-            continue
-        candidates = name_candidates(credit)
-        if not 2 <= len(candidates) <= 12:
-            continue
-        amount = money(credit.fields["valor"])
-        combinations_found = [
-            group
-            for size in range(2, len(candidates) + 1)
-            for group in combinations(candidates, size)
-            if sum((expected_values[index] for index in group), Decimal("0.00"))
-            == amount
-        ]
-        if len(combinations_found) == 1:
-            for index in combinations_found[0]:
-                allocations[index].append((credit, expected_values[index]))
-                pending.remove(index)
-            used_bank_lines.add(credit.line)
+        # One deposit may combine several titles of the same customer.
+        for credit in available:
+            if credit.line in used_bank_lines:
+                continue
+            candidates = candidate_rows(credit)
+            if not 2 <= len(candidates) <= 12:
+                continue
+            amount = money(credit.fields["valor"])
+            combinations_found = [
+                group
+                for size in range(2, len(candidates) + 1)
+                for group in combinations(candidates, size)
+                if sum((expected_values[index] for index in group), Decimal("0.00"))
+                == amount
+            ]
+            if len(combinations_found) == 1:
+                for index in combinations_found[0]:
+                    found[index].append((credit, expected_values[index]))
+                    pending_rows.remove(index)
+                used_bank_lines.add(credit.line)
 
-    # A remaining unique name match can be a partial or excess payment.
-    for credit in available:
-        if credit.line in used_bank_lines:
-            continue
-        candidates = name_candidates(credit)
-        if len(candidates) == 1:
-            index = candidates[0]
-            allocations[index].append((credit, money(credit.fields["valor"])))
-            used_bank_lines.add(credit.line)
-            paid = sum((amount for _, amount in allocations[index]), Decimal("0.00"))
-            if paid >= expected_values[index]:
-                pending.remove(index)
+        # A remaining unique match can be a partial or excess payment.
+        for credit in available:
+            if credit.line in used_bank_lines:
+                continue
+            candidates = candidate_rows(credit)
+            if len(candidates) == 1:
+                index = candidates[0]
+                found[index].append((credit, money(credit.fields["valor"])))
+                used_bank_lines.add(credit.line)
+                paid = sum((amount for _, amount in found[index]), Decimal("0.00"))
+                if paid >= expected_values[index]:
+                    pending_rows.remove(index)
+
+    allocate_candidates(name_candidates, pending, allocations)
 
     for index in unresolved:
         if allocations[index]:
             record_match(index, allocations[index], "nome")
+
+    tax_pending = {index for index in unresolved if not allocations[index]}
+    tax_allocations: dict[int, list[tuple[Row, Decimal]]] = defaultdict(list)
+
+    def tax_candidates(credit: Row) -> list[int]:
+        return sorted(
+            index
+            for index in tax_pending
+            if tax_id_in_history(tax_ids[index], credit.fields["historico"])
+        )
+
+    allocate_candidates(tax_candidates, tax_pending, tax_allocations)
+    for index in unresolved:
+        if tax_allocations[index]:
+            record_match(index, tax_allocations[index], "cnpj/tax_id")
 
     grouped_indices: set[int] = set()
     for indices in distinct_cross_groups.values():
@@ -460,7 +498,10 @@ def main() -> None:
         "01/02: mesmo CNPJ, vencimento e valor = um título; "
         "mesmo CNPJ/vencimento com valores diferentes = grupo."
     )
-    print("03: nosso_numero = documento; depois cliente = historico. Apenas tipo C.")
+    print(
+        "03: nosso_numero = documento; depois cliente ou CNPJ/tax_id em historico. "
+        "Apenas tipo C."
+    )
     for category in categories:
         items = results[category]
         print(f"\n{category} ({category_counts[category]})")
