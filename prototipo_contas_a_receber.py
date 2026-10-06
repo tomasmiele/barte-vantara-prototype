@@ -3,6 +3,7 @@
 Consolida títulos repetidos em 01/02 por CNPJ, vencimento e valor.
 Títulos distintos do mesmo CNPJ e vencimento são classificados em conjunto.
 Depois usa nosso_numero, nome e CNPJ/tax_id para procurar créditos no extrato.
+Uma última busca por valor gera apenas pagamentos possíveis.
 Os arquivos de entrada são abertos apenas para leitura.
 """
 
@@ -284,7 +285,11 @@ def reconcile(
                 " | crédito após vencimento" if last_payment > due else ""
             )
         elif paid > expected:
-            category = "VALOR RECEBIDO MAIOR QUE O TÍTULO"
+            category = (
+                "PAGAMENTO MAIOR ATRASADO"
+                if last_payment > due
+                else "PAGAMENTO MAIOR EM DIA"
+            )
             description = f"{detail} | excedente={brl(paid - expected)}"
         elif last_payment > due:
             category = "PAGAMENTO ATRASADO"
@@ -456,8 +461,108 @@ def reconcile(
         if tax_allocations[index]:
             record_match(index, tax_allocations[index], "cnpj/tax_id")
 
-    grouped_indices: set[int] = set()
+    grouped_indices = {
+        index for indices in distinct_cross_groups.values() for index in indices
+    }
+    possible_units = [
+        tuple(indices)
+        for indices in distinct_cross_groups.values()
+        if all(not matched_payments[index] for index in indices)
+    ]
+    possible_units.extend(
+        (index,)
+        for index in active_indices
+        if index not in grouped_indices and not matched_payments[index]
+    )
+
+    # Value alone is weak evidence. Exclude credits that identify another
+    # known customer or already carry a document number.
+    known_names = {alias for aliases in name_aliases for alias in aliases}
+    known_tax_ids = {tax_id for tax_id in tax_ids if tax_id}
+
+    def unidentified_credit(credit: Row) -> bool:
+        history = credit.fields["historico"]
+        return (
+            credit.fields["tipo"].upper() == "C"
+            and not credit.fields["documento"]
+            and credit.line not in used_bank_lines
+            and not any(name_in_history(name, history) for name in known_names)
+            and not any(tax_id_in_history(tax_id, history) for tax_id in known_tax_ids)
+        )
+
+    value_credits = [credit for credit in bank if unidentified_credit(credit)]
+
+    def unit_value(unit: tuple[int, ...]) -> Decimal:
+        return sum((expected_values[index] for index in unit), Decimal("0.00"))
+
+    possible_matched: set[tuple[int, ...]] = set()
+    possible_used_lines: set[int] = set()
+
+    def record_possible(unit: tuple[int, ...], credit: Row) -> None:
+        expected = unit_value(unit)
+        received = money(credit.fields["valor"])
+        due = due_dates[unit[0]]
+        payment_date = parse_date(credit.fields["data"])
+        label = labels[unit[0]] if len(unit) == 1 else group_label(list(unit))
+        detail = (
+            f"{label} | recebido={brl(received)} | data={payment_date:%d/%m/%Y} "
+            f"| linha do extrato={credit.line} | critério=valor"
+        )
+        if received < expected:
+            category = "POSSÍVEL PAGAMENTO INCOMPLETO"
+            detail += f" | faltam={brl(expected - received)}"
+            if payment_date > due:
+                detail += " | crédito após vencimento"
+        elif payment_date > due:
+            category = "POSSÍVEL PAGAMENTO ATRASADO"
+        else:
+            category = "POSSÍVEL PAGAMENTO EM DIA"
+        results[category].append(detail)
+        category_counts[category] += len(unit)
+        possible_matched.add(unit)
+        possible_used_lines.add(credit.line)
+
+    # Exact, unique value matches come first. No credit or title is reused.
+    for unit in possible_units:
+        candidates = [
+            credit
+            for credit in value_credits
+            if credit.line not in possible_used_lines
+            and money(credit.fields["valor"]) == unit_value(unit)
+        ]
+        competing_units = [
+            other for other in possible_units if unit_value(other) == unit_value(unit)
+        ]
+        if len(candidates) == 1 and len(competing_units) == 1:
+            record_possible(unit, candidates[0])
+
+    # A partial amount is only a possible match when both sides are unique.
+    for unit in possible_units:
+        if unit in possible_matched:
+            continue
+        candidates = [
+            credit
+            for credit in value_credits
+            if credit.line not in possible_used_lines
+            and Decimal("0.00") < money(credit.fields["valor"]) < unit_value(unit)
+        ]
+        if len(candidates) != 1:
+            continue
+        credit = candidates[0]
+        competing_units = [
+            other
+            for other in possible_units
+            if other not in possible_matched
+            and Decimal("0.00") < money(credit.fields["valor"]) < unit_value(other)
+        ]
+        if len(competing_units) == 1:
+            record_possible(unit, credit)
+
+    grouped_indices = set()
     for indices in distinct_cross_groups.values():
+        if tuple(indices) in possible_matched:
+            grouped_indices.update(indices)
+            continue
         matches = [match for index in indices for match in matched_payments[index]]
         methods = [method for index in indices for method in match_methods[index]]
         if matches:
@@ -468,7 +573,7 @@ def reconcile(
         grouped_indices.update(indices)
 
     for index in active_indices:
-        if index in grouped_indices:
+        if index in grouped_indices or (index,) in possible_matched:
             continue
         if matched_payments[index]:
             classify([index], matched_payments[index], match_methods[index])
@@ -483,11 +588,15 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=Path(__file__).parent / "data")
     args = parser.parse_args()
     categories = (
+        "PAGAMENTO NÃO LOCALIZADO",
         "PAGAMENTO EM DIA",
         "PAGAMENTO ATRASADO",
         "PAGAMENTO INCOMPLETO",
-        "PAGAMENTO NÃO LOCALIZADO",
-        "VALOR RECEBIDO MAIOR QUE O TÍTULO",
+        "PAGAMENTO MAIOR EM DIA",
+        "PAGAMENTO MAIOR ATRASADO",
+        "POSSÍVEL PAGAMENTO EM DIA",
+        "POSSÍVEL PAGAMENTO ATRASADO",
+        "POSSÍVEL PAGAMENTO INCOMPLETO",
     )
     category_counts: Counter[str] = Counter()
     try:
@@ -502,6 +611,7 @@ def main() -> None:
         "03: nosso_numero = documento; depois cliente ou CNPJ/tax_id em historico. "
         "Apenas tipo C."
     )
+    print("Créditos restantes sem identificação: correspondência possível por valor.")
     for category in categories:
         items = results[category]
         print(f"\n{category} ({category_counts[category]})")
