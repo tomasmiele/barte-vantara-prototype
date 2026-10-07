@@ -89,21 +89,83 @@ PAGAMENTO MAIOR ATRASADO (1)
 - Para pagamentos com mais de um crédito associado, a classificação de prazo usa a **data do último crédito**. Valores recebidos a menor ou a maior são mostrados sem ajuste automático, cobrança ou devolução.
 - O programa não oferece interface gráfica, API nem integração bancária. Revisão humana continua necessária, especialmente para os `POSSÍVEL PAGAMENTO` e títulos não localizados.
 
-## Protótipo de contas a pagar: preparação dos e-mails
+# Protótipo de contas a pagar
 
-Configure `OPENAI_API_KEY` no ambiente ou em `.env` na raiz do projeto e execute `python3 prototipo_contas_a_pagar.py`. Esse comando executa a sequência completa: extrai os campos dos e-mails do único `04*.txt` em `data/`, relaciona cada documento aos débitos do único `03*.csv` e classifica todos os e-mails. O resultado final é `data/emails_contas_a_pagar.csv`, com `company,date,document_type,document_id,amount_due,due_date,payment_row,classification`. Para usar outra pasta, passe `--data-dir "/caminho/para/o/data-pack"`; para escolher outro destino, passe `--output "/caminho/arquivo.csv"`. Não há dependências Python externas.
+Este programa usa os e-mails do arquivo **04** e os débitos (`tipo=D`) do extrato **03** para classificar cada cobrança. Sua execução é independente do protótipo de contas a receber.
+
+## O que é necessário
+
+- **Python 3.10 ou superior** e um terminal. Confira com `python3 --version` no macOS/Linux ou `py -3 --version` no Windows. Se necessário, instale Python pelo [site oficial](https://www.python.org/downloads/).
+- O **data pack** com `03_extrato_bancario_jul2026.csv` e `04_caixa_de_entrada_contas_a_pagar.txt`. A pasta `data/` está no `.gitignore`, portanto não vem com o clone do repositório.
+- Conexão à internet, uma conta na [OpenAI Platform](https://platform.openai.com/) com acesso à API, uma chave criada em [API keys](https://platform.openai.com/api-keys) e créditos/faturamento disponíveis. Veja o [guia oficial de início da API](https://developers.openai.com/api/docs/quickstart).
+
+Não há dependências Python externas para instalar com `pip`. O programa roda localmente e não depende de Lovable, n8n ou Replit. O Git só é necessário se você optar por clonar o repositório.
+
+## Preparação, passo a passo
+
+1. Obtenha o projeto por download ou, se tiver Git instalado, execute:
+
+   ```sh
+   git clone https://github.com/tomasmiele/barte-vantara-prototype.git
+   cd barte-vantara-prototype
+   ```
+
+   Se baixou um ZIP, extraia-o e abra um terminal na pasta que contém `prototipo_contas_a_pagar.py`.
+
+2. Confirme a versão do Python com o comando indicado acima.
+
+3. Crie a pasta `data/` na raiz do projeto, se necessário, e copie os arquivos 03 e 04 do data pack, mantendo seus nomes:
+
+   ```text
+   barte-vantara-prototype/
+   ├── prototipo_contas_a_pagar.py
+   └── data/
+       ├── 03_extrato_bancario_jul2026.csv
+       └── 04_caixa_de_entrada_contas_a_pagar.txt
+   ```
+
+   O programa procura exatamente um `03*.csv` e um `04*.txt` na pasta indicada.
+
+4. Na raiz do projeto, crie um arquivo `.env` com a sua chave:
+
+   ```dotenv
+   OPENAI_API_KEY=SUA_CHAVE_AQUI
+   ```
+
+   Substitua o marcador pela chave da sua equipe. Como alternativa, defina `OPENAI_API_KEY` como variável de ambiente no terminal. O programa lê primeiro a variável de ambiente e, se ela não existir, procura `.env` ao lado do script. Não envie a chave ao Git; `.env` já está no `.gitignore`.
+
+5. Com o terminal na raiz do projeto, execute o comando abaixo. Não é necessário rodar `pip install`.
+
+## Como executar
+
+Depois de configurar a chave, execute na raiz do projeto:
+
+```sh
+python3 prototipo_contas_a_pagar.py
+```
+
+No Windows, use `py -3 prototipo_contas_a_pagar.py`. Esse comando executa a sequência **completa**: extrai os campos dos e-mails do único `04*.txt` em `data/`, relaciona cada documento aos débitos do único `03*.csv` e classifica todos os e-mails. Para usar o data pack em outra pasta, execute `python3 prototipo_contas_a_pagar.py --data-dir "/caminho/para/o/data-pack"`; para escolher outro destino, acrescente `--output "/caminho/arquivo.csv"`.
 
 Cada bloco iniciado por `--- E-MAIL n ---` corresponde a um e-mail. O programa lê os campos `De` e `Data` do cabeçalho, ignora o trecho de WhatsApp, agrupa pelo domínio completo do remetente e ordena cada grupo pela data mais antiga. A coluna `company` contém a parte inicial do domínio: `financeiro@embalagenssaojorge.com.br` gera `embalagenssaojorge`. A data é gravada como `AAAA-MM-DD`.
 
 O programa envia cada e-mail separadamente para `gpt-6-luna`, sem histórico de e-mails anteriores, com saída JSON restrita aos quatro campos extraídos. `amount_due` usa ponto decimal e duas casas; `due_date` usa `AAAA-MM-DD`. IDs compostos somente por dígitos são gravados como texto sem zeros à esquerda: `088231` vira `88231`. IDs alfanuméricos são preservados. O modelo interpreta prazos em linguagem natural: para "5 dias após o recebimento", usa a data do cabeçalho como recebimento quando o e-mail não informa outra data e soma cinco dias corridos. A chave da API não é impressa nem gravada no CSV. O comando completo faz uma chamada por e-mail para extração e outra por empresa/documento distinto para relacionar o histórico, podendo gerar cobrança na API. A classificação final não usa a API.
 
-O CSV final só substitui a versão anterior se as três etapas terminarem sem erro. A pasta `data/` está no `.gitignore`, inclusive o CSV gerado.
+Durante a execução, o terminal mostra uma linha de progresso por e-mail e, ao final, o número de e-mails classificados e o caminho do resultado. O CSV final só substitui a versão anterior se as três etapas terminarem sem erro. Por padrão, ele aparece em `data/emails_contas_a_pagar.csv` e contém `company,date,document_type,document_id,amount_due,due_date,payment_row,classification`. Campos sem ID ou pagamento ficam vazios. Com o data pack de julho de 2026, a saída esperada é:
+
+```csv
+company,date,document_type,document_id,amount_due,due_date,payment_row,classification
+embalagenssaojorge,2026-07-06,nota_fiscal,88231,18900.00,2026-07-20,10,paid
+embalagenssaojorge,2026-07-18,nota_fiscal,88231,19278.00,2026-07-25,10,wrongful billing
+transportadoraroterapido,2026-07-09,ct_e,,34117.82,2026-07-14,,not paid and late
+```
+
+`payment_row=10` indica a linha 10 do arquivo 03, **incluindo o cabeçalho como linha 1**. O CSV usa UTF-8 com BOM e vírgula como separador. A pasta `data/`, inclusive esse resultado, não é versionada pelo Git.
 
 ### Procurar pagamentos no extrato 03
 
 Para refazer apenas a relação com o extrato, execute `python3 prototipo_contas_a_pagar.py --check-payments`. Esta etapa lê `data/emails_contas_a_pagar.csv` e o único `03*.csv` em `data/`, considera apenas linhas com `tipo=D` e envia à API somente a empresa, o tipo e o ID do documento junto aos números das linhas e textos de `historico` desses débitos. Para usar outro CSV de e-mails, passe `--emails-csv "/caminho/emails.csv"`.
 
-E-mails com a mesma empresa e ID de documento geram uma única chamada; se o tipo variar, os tipos são enviados juntos. Se o ID estiver ausente, cada linha é verificada separadamente. O resultado é salvo na coluna `payment_row` do CSV de e-mails, sem imprimir uma resposta por consulta no terminal. A numeração é a linha física do extrato, incluindo o cabeçalho como linha 1. Esta busca usa apenas o texto de `historico`; ainda não compara valores e datas.
+E-mails com a mesma empresa e ID de documento geram uma única chamada; se o tipo variar, os tipos são enviados juntos. Se o ID estiver ausente, cada linha é verificada separadamente. O resultado é salvo na coluna `payment_row` do CSV de e-mails, sem imprimir uma resposta por consulta no terminal. Esta busca usa apenas o texto de `historico`; ainda não compara valores e datas. Ao executar só esta etapa, a classificação anterior é apagada para não ficar desatualizada: em seguida execute `--classify`.
 
 ### Classificar os e-mails sem API
 
@@ -116,3 +178,11 @@ Para refazer apenas a classificação, execute `python3 prototipo_contas_a_pagar
 - `not paid`: não há pagamento do valor esperado e a última data do extrato ainda não passou do vencimento.
 
 Um débito com valor diferente não confirma pagamento. O programa compara valores exatos, sem somar pagamentos parciais. A classificação é feita com a informação disponível até a última data do extrato.
+
+### Limitações conhecidas de contas a pagar
+
+- O arquivo 04 é uma amostra de três e-mails em texto, marcada por `--- E-MAIL n ---`. O programa não lê uma caixa de entrada real nem abre anexos, boletos, PDFs ou planilhas mencionados nas mensagens. Outros formatos de exportação precisam ser adaptados.
+- A extração de tipo, ID, valor e vencimento e a busca semântica no `historico` dependem das respostas do modelo `gpt-6-luna`. Revise resultados duvidosos. No exemplo do CT-e, o prazo de cinco dias é contado a partir da data do cabeçalho do e-mail, assumida como recebimento.
+- A busca considera somente lançamentos `tipo=D` e retorna uma única linha do extrato por empresa/documento. Uma descrição semelhante não prova por si só que a dívida foi liquidada. A classificação exige **valor exatamente igual**; não soma parcelas nem trata automaticamente juros, descontos ou pagamentos parciais.
+- `wrongful billing` segue a regra de haver outra linha da mesma empresa e ID com vencimento anterior e pagamento confirmado no extrato. No exemplo, o segundo e-mail foi enviado em 18/07, antes do pagamento de 20/07; portanto o rótulo descreve a situação vista no extrato completo, não o que já era conhecido quando o e-mail chegou.
+- `not paid` e `not paid and late` usam a **última data do arquivo 03**, não a data atual. A execução não acessa o banco nem atualiza o extrato automaticamente. Uma falha de rede, acesso à API ou créditos interrompe a execução; nesse caso, o comando completo preserva o CSV final anterior.
