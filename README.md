@@ -89,8 +89,10 @@ PAGAMENTO MAIOR ATRASADO (1)
 
 ## Protótipo de contas a pagar: preparação dos e-mails
 
-Execute `python3 prototipo_contas_a_pagar.py` na raiz do projeto. O programa lê o único arquivo `04*.txt` em `data/` e cria `data/emails_contas_a_pagar.csv`, com as colunas `company,date`. Para usar outra pasta, passe `--data-dir "/caminho/para/o/data-pack"`; para escolher outro destino, passe `--output "/caminho/arquivo.csv"`.
+Configure `OPENAI_API_KEY` no ambiente ou em `.env` na raiz do projeto e execute `python3 prototipo_contas_a_pagar.py`. O programa lê o único arquivo `04*.txt` em `data/` e cria `data/emails_contas_a_pagar.csv` com `company,date,document_type,document_id,amount_due,due_date`. Para usar outra pasta, passe `--data-dir "/caminho/para/o/data-pack"`; para escolher outro destino, passe `--output "/caminho/arquivo.csv"`. Não há dependências Python externas.
 
 Cada bloco iniciado por `--- E-MAIL n ---` corresponde a um e-mail. O programa lê os campos `De` e `Data` do cabeçalho, ignora o trecho de WhatsApp, agrupa pelo domínio completo do remetente e ordena cada grupo pela data mais antiga. A coluna `company` contém a parte inicial do domínio: `financeiro@embalagenssaojorge.com.br` gera `embalagenssaojorge`. A data é gravada como `AAAA-MM-DD`.
+
+O programa envia cada e-mail separadamente para `gpt-6-luna`, sem histórico de e-mails anteriores, com saída JSON restrita aos quatro campos extraídos. `amount_due` usa ponto decimal e duas casas; `due_date` usa `AAAA-MM-DD`. Campos sem informação suficiente ficam vazios no CSV, como o vencimento relativo do e-mail de CT-e. A chave da API não é impressa nem gravada no CSV. Cada execução faz uma nova chamada por e-mail e pode gerar cobrança na API.
 
 Esta etapa organiza os e-mails; a conciliação com os débitos (`tipo=D`) do extrato 03 ainda não está implementada. A pasta `data/` está no `.gitignore`, inclusive o CSV gerado.
