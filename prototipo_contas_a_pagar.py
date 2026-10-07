@@ -37,12 +37,16 @@ INSTRUCTIONS = (
     "amount_due, due_date. Use somente informações do próprio e-mail. "
     "Se houver nota fiscal com boleto, classifique como nota_fiscal e use "
     "o número da nota; boleto é o meio de pagamento. Para CT-e use ct_e. "
-    "Mantenha zeros à esquerda no ID. Se houver valor original e atualizado, "
+    "Devolva o ID como texto, sem prefixo como 'NF'. Se houver valor original e atualizado, "
     "use o valor atualizado a pagar. Escreva amount_due em BRL com ponto "
     "decimal e duas casas, sem R$. Escreva due_date em AAAA-MM-DD. "
-    "Se o vencimento tiver só dia/mês, use o ano da Data do cabeçalho "
-    "apenas quando for inequívoco. Prazo relativo sem data de referência "
-    "conhecida não é data exata. Use null para qualquer campo ausente; "
+    "Interprete também vencimentos descritos em texto, como '5 dias após o "
+    "recebimento'. Use a Data do cabeçalho como data de recebimento quando "
+    "não houver outra data de recebimento no e-mail; some dias corridos, "
+    "exceto se o texto disser dias úteis. Se o vencimento tiver só dia/mês, "
+    "use o ano da Data do cabeçalho quando for inequívoco. Prefira um "
+    "vencimento atualizado a um original. Use null só se o campo realmente "
+    "não puder ser determinado; "
     "não invente números, valores ou datas."
 )
 
@@ -132,6 +136,12 @@ def validate_extraction(data: object, number: int) -> dict[str, str | None]:
     if any(value is not None and not isinstance(value, str) for value in data.values()):
         raise ValueError(f"Tipo de dado inválido no JSON do E-MAIL {number}")
     result: dict[str, str | None] = dict(data)
+    document_id = result["document_id"]
+    if document_id is not None:
+        document_id = document_id.strip()
+        if re.fullmatch(r"[0-9]+", document_id):
+            document_id = document_id.lstrip("0") or "0"
+        result["document_id"] = document_id or None
     amount = result["amount_due"]
     if amount is not None:
         try:
@@ -156,8 +166,8 @@ def extract_json(email: Email, key: str) -> dict[str, str | None]:
         "model": MODEL,
         "instructions": INSTRUCTIONS,
         "input": email.content,
-        "reasoning": {"effort": "none"},
-        "max_output_tokens": 250,
+        "reasoning": {"effort": "low"},
+        "max_output_tokens": 400,
         "store": False,
         "text": {
             "format": {
