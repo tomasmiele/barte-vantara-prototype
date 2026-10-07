@@ -89,16 +89,28 @@ PAGAMENTO MAIOR ATRASADO (1)
 
 ## Protótipo de contas a pagar: preparação dos e-mails
 
-Configure `OPENAI_API_KEY` no ambiente ou em `.env` na raiz do projeto e execute `python3 prototipo_contas_a_pagar.py`. O programa lê o único arquivo `04*.txt` em `data/` e cria `data/emails_contas_a_pagar.csv` com `company,date,document_type,document_id,amount_due,due_date`. Para usar outra pasta, passe `--data-dir "/caminho/para/o/data-pack"`; para escolher outro destino, passe `--output "/caminho/arquivo.csv"`. Não há dependências Python externas.
+Configure `OPENAI_API_KEY` no ambiente ou em `.env` na raiz do projeto e execute `python3 prototipo_contas_a_pagar.py`. Esse comando executa a sequência completa: extrai os campos dos e-mails do único `04*.txt` em `data/`, relaciona cada documento aos débitos do único `03*.csv` e classifica todos os e-mails. O resultado final é `data/emails_contas_a_pagar.csv`, com `company,date,document_type,document_id,amount_due,due_date,payment_row,classification`. Para usar outra pasta, passe `--data-dir "/caminho/para/o/data-pack"`; para escolher outro destino, passe `--output "/caminho/arquivo.csv"`. Não há dependências Python externas.
 
 Cada bloco iniciado por `--- E-MAIL n ---` corresponde a um e-mail. O programa lê os campos `De` e `Data` do cabeçalho, ignora o trecho de WhatsApp, agrupa pelo domínio completo do remetente e ordena cada grupo pela data mais antiga. A coluna `company` contém a parte inicial do domínio: `financeiro@embalagenssaojorge.com.br` gera `embalagenssaojorge`. A data é gravada como `AAAA-MM-DD`.
 
-O programa envia cada e-mail separadamente para `gpt-6-luna`, sem histórico de e-mails anteriores, com saída JSON restrita aos quatro campos extraídos. `amount_due` usa ponto decimal e duas casas; `due_date` usa `AAAA-MM-DD`. IDs compostos somente por dígitos são gravados como texto sem zeros à esquerda: `088231` vira `88231`. IDs alfanuméricos são preservados. O modelo interpreta prazos em linguagem natural: para "5 dias após o recebimento", usa a data do cabeçalho como recebimento quando o e-mail não informa outra data e soma cinco dias corridos. A chave da API não é impressa nem gravada no CSV. Cada execução faz uma nova chamada por e-mail e pode gerar cobrança na API.
+O programa envia cada e-mail separadamente para `gpt-6-luna`, sem histórico de e-mails anteriores, com saída JSON restrita aos quatro campos extraídos. `amount_due` usa ponto decimal e duas casas; `due_date` usa `AAAA-MM-DD`. IDs compostos somente por dígitos são gravados como texto sem zeros à esquerda: `088231` vira `88231`. IDs alfanuméricos são preservados. O modelo interpreta prazos em linguagem natural: para "5 dias após o recebimento", usa a data do cabeçalho como recebimento quando o e-mail não informa outra data e soma cinco dias corridos. A chave da API não é impressa nem gravada no CSV. O comando completo faz uma chamada por e-mail para extração e outra por empresa/documento distinto para relacionar o histórico, podendo gerar cobrança na API. A classificação final não usa a API.
 
-Esta etapa organiza os e-mails para a busca inicial nos débitos (`tipo=D`) do extrato 03. A pasta `data/` está no `.gitignore`, inclusive o CSV gerado.
+O CSV final só substitui a versão anterior se as três etapas terminarem sem erro. A pasta `data/` está no `.gitignore`, inclusive o CSV gerado.
 
 ### Procurar pagamentos no extrato 03
 
-Depois de gerar o CSV de e-mails, execute `python3 prototipo_contas_a_pagar.py --check-payments`. Esta etapa lê `data/emails_contas_a_pagar.csv` e o único `03*.csv` em `data/`, considera apenas linhas com `tipo=D` e envia à API somente a empresa, o tipo e o ID do documento junto aos números das linhas e textos de `historico` desses débitos. Para usar outro CSV de e-mails, passe `--emails-csv "/caminho/emails.csv"`.
+Para refazer apenas a relação com o extrato, execute `python3 prototipo_contas_a_pagar.py --check-payments`. Esta etapa lê `data/emails_contas_a_pagar.csv` e o único `03*.csv` em `data/`, considera apenas linhas com `tipo=D` e envia à API somente a empresa, o tipo e o ID do documento junto aos números das linhas e textos de `historico` desses débitos. Para usar outro CSV de e-mails, passe `--emails-csv "/caminho/emails.csv"`.
 
-E-mails com a mesma empresa e ID de documento geram uma única chamada; se o tipo variar, os tipos são enviados juntos. Se o ID estiver ausente, cada linha é verificada separadamente. O terminal mostra a linha correspondente do arquivo 03 para cada consulta, deixa `linha=` vazia quando não há correspondência e informa o total de chamadas desta etapa. A numeração é a linha física do CSV, incluindo o cabeçalho como linha 1. Esta verificação usa apenas o texto de `historico`; ainda não compara valores, datas ou confirma a liquidação financeira.
+E-mails com a mesma empresa e ID de documento geram uma única chamada; se o tipo variar, os tipos são enviados juntos. Se o ID estiver ausente, cada linha é verificada separadamente. O resultado é salvo na coluna `payment_row` do CSV de e-mails, sem imprimir uma resposta por consulta no terminal. A numeração é a linha física do extrato, incluindo o cabeçalho como linha 1. Esta busca usa apenas o texto de `historico`; ainda não compara valores e datas.
+
+### Classificar os e-mails sem API
+
+Para refazer apenas a classificação, execute `python3 prototipo_contas_a_pagar.py --classify`. O programa usa `payment_row` quando ela contém uma linha válida. Se estiver ausente ou vazia, procura localmente uma única linha `tipo=D` cujo `historico` contenha o ID do documento; quando não há ID, procura o nome da empresa. Correspondências ambíguas não são aceitas. O resultado é gravado nas colunas `payment_row` e `classification` do CSV. Esta execução não faz chamadas à API.
+
+- `paid`: débito do mesmo valor em data igual ou anterior ao vencimento.
+- `late payment`: débito do mesmo valor depois do vencimento.
+- `wrongful billing`: outro e-mail da mesma empresa e ID tem vencimento anterior e já foi classificado como `paid` ou `late payment`.
+- `not paid and late`: não há pagamento do valor esperado e a última data do extrato passou do vencimento.
+- `not paid`: não há pagamento do valor esperado e a última data do extrato ainda não passou do vencimento.
+
+Um débito com valor diferente não confirma pagamento. O programa compara valores exatos, sem somar pagamentos parciais. A classificação é feita com a informação disponível até a última data do extrato.

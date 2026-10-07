@@ -1,4 +1,4 @@
-"""Extrai dados de pagamento dos e-mails do arquivo 04 para um CSV."""
+"""Extrai, relaciona e classifica os e-mails de contas a pagar."""
 
 from __future__ import annotations
 
@@ -7,9 +7,11 @@ import csv
 import json
 import os
 import re
+import tempfile
+import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -73,6 +75,15 @@ class Email:
     company: str
     date: datetime
     content: str
+
+
+@dataclass(frozen=True)
+class BankRow:
+    line: int
+    date: date
+    history: str
+    amount: Decimal
+    kind: str
 
 
 def input_file(directory: Path) -> Path:
@@ -240,7 +251,7 @@ def extract_json(email: Email, key: str) -> dict[str, str | None]:
     )
 
 
-def payment_queries(path: Path) -> list[dict[str, str]]:
+def payment_queries(path: Path) -> list[dict]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         required = {"company", "document_type", "document_id"}
@@ -250,7 +261,7 @@ def payment_queries(path: Path) -> list[dict[str, str]]:
             )
         queries = []
         positions = {}
-        for row in reader:
+        for index, row in enumerate(reader):
             company = (row["company"] or "").strip()
             document_type = (row["document_type"] or "").strip()
             document_id = (row["document_id"] or "").strip()
@@ -261,9 +272,7 @@ def payment_queries(path: Path) -> list[dict[str, str]]:
             if re.fullmatch(r"[0-9]+", document_id):
                 document_id = document_id.lstrip("0") or "0"
             # Sem ID, duas linhas não podem ser tratadas como o mesmo documento.
-            identity = (
-                ("id", document_id) if document_id else ("linha", reader.line_num)
-            )
+            identity = ("id", document_id) if document_id else ("linha", index)
             group = (company.casefold(), identity)
             if group not in positions:
                 positions[group] = len(queries)
@@ -272,16 +281,20 @@ def payment_queries(path: Path) -> list[dict[str, str]]:
                         "company": company,
                         "document_type": document_type,
                         "document_id": document_id,
+                        "indices": [index],
                     }
                 )
-            elif document_type:
+            else:
                 existing = queries[positions[group]]
+                existing["indices"].append(index)
                 types = (
                     existing["document_type"].split(" / ")
                     if existing["document_type"]
                     else []
                 )
-                if document_type.casefold() not in {item.casefold() for item in types}:
+                if document_type and document_type.casefold() not in {
+                    item.casefold() for item in types
+                }:
                     existing["document_type"] = " / ".join((*types, document_type))
     return queries
 
@@ -301,13 +314,191 @@ def debit_histories(path: Path) -> list[dict[str, int | str]]:
         ]
 
 
+def read_bank(path: Path) -> list[BankRow]:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter=";")
+        required = {"data", "historico", "valor", "tipo"}
+        if not reader.fieldnames or not required.issubset(reader.fieldnames):
+            raise ValueError(
+                f"Colunas ausentes em {path.name}: {', '.join(sorted(required))}"
+            )
+        rows = []
+        for row in reader:
+            line = reader.line_num
+            try:
+                bank_date = datetime.strptime(row["data"].strip(), "%d/%m/%Y").date()  # noqa: DTZ007
+                amount = Decimal(
+                    row["valor"].strip().replace(".", "").replace(",", ".")
+                )
+            except (ValueError, InvalidOperation) as exc:
+                raise ValueError(
+                    f"Data ou valor inválido em {path.name}, linha {line}"
+                ) from exc
+            rows.append(
+                BankRow(
+                    line,
+                    bank_date,
+                    row["historico"].strip(),
+                    amount,
+                    row["tipo"].strip().upper(),
+                )
+            )
+    if not rows:
+        raise ValueError(f"Extrato vazio: {path}")
+    return rows
+
+
+def read_email_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        required = {
+            "company",
+            "date",
+            "document_type",
+            "document_id",
+            "amount_due",
+            "due_date",
+        }
+        if not reader.fieldnames or not required.issubset(reader.fieldnames):
+            raise ValueError(
+                f"Colunas ausentes em {path.name}: {', '.join(sorted(required))}"
+            )
+        rows = list(reader)
+        if any(None in row for row in rows):
+            raise ValueError(f"Colunas extras em {path.name}")
+        return reader.fieldnames, rows
+
+
+def write_email_rows(path: Path, fields: list[str], rows: list[dict[str, str]]) -> None:
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def normalized_text(value: str) -> str:
+    ascii_text = unicodedata.normalize("NFKD", value.casefold())
+    return "".join(char for char in ascii_text if char.isascii() and char.isalnum())
+
+
+def matching_debit(row: dict[str, str], debits: list[BankRow]) -> BankRow | None:
+    document_id = row["document_id"].strip()
+    if re.fullmatch(r"[0-9]+", document_id):
+        document_id = document_id.lstrip("0") or "0"
+        candidates = [
+            bank
+            for bank in debits
+            if any(
+                (token.lstrip("0") or "0") == document_id
+                for token in re.findall(r"[0-9]+", bank.history)
+            )
+        ]
+    elif document_id:
+        candidates = [
+            bank
+            for bank in debits
+            if normalized_text(document_id) in normalized_text(bank.history)
+        ]
+    else:
+        company = normalized_text(row["company"])
+        candidates = [
+            bank
+            for bank in debits
+            if len(company) >= 8 and company in normalized_text(bank.history)
+        ]
+    candidates = [bank for bank in candidates if "TARIFA" not in bank.history.upper()]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def classify_emails(directory: Path, emails_csv: Path) -> int:
+    fields, rows = read_email_rows(emails_csv)
+    bank_rows = read_bank(bank_file(directory))
+    bank_by_line = {row.line: row for row in bank_rows if row.kind == "D"}
+    debits = list(bank_by_line.values())
+    latest_bank_date = max(row.date for row in bank_rows)
+    prior_settled: dict[tuple[str, str], list[date]] = defaultdict(list)
+    has_payment_row = "payment_row" in fields
+
+    def due_date_at(index: int) -> date:
+        try:
+            return date.fromisoformat(rows[index]["due_date"].strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"Vencimento inválido no CSV de e-mails, linha {index + 2}"
+            ) from exc
+
+    for index in sorted(range(len(rows)), key=lambda item: (due_date_at(item), item)):
+        row = rows[index]
+        due_date = due_date_at(index)
+        try:
+            amount_due = Decimal(row["amount_due"].strip())
+        except InvalidOperation as exc:
+            raise ValueError(
+                f"Valor inválido no CSV de e-mails, linha {index + 2}"
+            ) from exc
+        document_id = row["document_id"].strip()
+        if re.fullmatch(r"[0-9]+", document_id):
+            document_id = document_id.lstrip("0") or "0"
+            row["document_id"] = document_id
+        identity = (
+            (row["company"].strip().casefold(), document_id) if document_id else None
+        )
+
+        if has_payment_row:
+            saved_line = (row.get("payment_row") or "").strip()
+            if saved_line and (
+                not saved_line.isdecimal() or int(saved_line) not in bank_by_line
+            ):
+                raise ValueError(
+                    f"payment_row inválido no CSV de e-mails, linha {index + 2}"
+                )
+            payment = (
+                bank_by_line[int(saved_line)]
+                if saved_line
+                else matching_debit(row, debits)
+            )
+        else:
+            payment = matching_debit(row, debits)
+        row["payment_row"] = str(payment.line) if payment else ""
+
+        already_paid = identity is not None and any(
+            previous_due < due_date for previous_due in prior_settled[identity]
+        )
+        if already_paid:
+            classification = "wrongful billing"
+        elif payment and payment.amount == amount_due:
+            classification = "paid" if payment.date <= due_date else "late payment"
+            if identity is not None:
+                prior_settled[identity].append(due_date)
+        elif latest_bank_date > due_date:
+            classification = "not paid and late"
+        else:
+            classification = "not paid"
+        row["classification"] = classification
+
+    output_fields = [*fields]
+    for field in ("payment_row", "classification"):
+        if field not in output_fields:
+            output_fields.append(field)
+    write_email_rows(emails_csv, output_fields, rows)
+    return len(rows)
+
+
 def match_payment(
-    query: dict[str, str], debits: list[dict[str, int | str]], key: str
+    query: dict, debits: list[dict[str, int | str]], key: str
 ) -> int | None:
     payload = {
         "model": MODEL,
         "instructions": PAYMENT_INSTRUCTIONS,
-        "input": json.dumps({**query, "debits": debits}, ensure_ascii=False),
+        "input": json.dumps(
+            {
+                "company": query["company"],
+                "document_type": query["document_type"],
+                "document_id": query["document_id"],
+                "debits": debits,
+            },
+            ensure_ascii=False,
+        ),
         "reasoning": {"effort": "low"},
         "max_output_tokens": 200,
         "store": False,
@@ -333,23 +524,19 @@ def match_payment(
 
 
 def check_payments(directory: Path, emails_csv: Path) -> None:
+    fields, email_rows = read_email_rows(emails_csv)
     queries = payment_queries(emails_csv)
     debits = debit_histories(bank_file(directory))
     key = api_key(Path(__file__).resolve().parent) if queries and debits else ""
-    calls = 0
     for query in queries:
-        if debits:
-            calls += 1
-            row = match_payment(query, debits, key)
-        else:
-            row = None
-        answer = "" if row is None else str(row)
-        print(
-            f"Chamada {calls if debits else 0} | empresa={query['company']} | "
-            f"documento={query['document_type']} | id={query['document_id']} | "
-            f"linha={answer}"
-        )
-    print(f"Chamadas OpenAI nesta etapa: {calls}")
+        row_number = match_payment(query, debits, key) if debits else None
+        for index in query["indices"]:
+            email_rows[index]["payment_row"] = str(row_number) if row_number else ""
+            email_rows[index].pop("classification", None)
+    output_fields = [field for field in fields if field != "classification"]
+    if "payment_row" not in output_fields:
+        output_fields.append("payment_row")
+    write_email_rows(emails_csv, output_fields, email_rows)
 
 
 def main() -> None:
@@ -368,16 +555,25 @@ def main() -> None:
         help="Compara os documentos do CSV de e-mails com os históricos tipo D do arquivo 03",
     )
     parser.add_argument(
+        "--classify",
+        action="store_true",
+        help="Classifica os e-mails com o extrato 03 sem usar a API",
+    )
+    parser.add_argument(
         "--emails-csv",
         type=Path,
         help="CSV de e-mails para --check-payments (padrão: data/emails_contas_a_pagar.csv)",
     )
     args = parser.parse_args()
+    if args.classify and args.check_payments:
+        parser.error("Escolha apenas --classify ou --check-payments")
+    emails_csv = args.emails_csv or args.data_dir / "emails_contas_a_pagar.csv"
+    if args.classify:
+        count = classify_emails(args.data_dir, emails_csv)
+        print(f"{count} e-mails classificados em {emails_csv}")
+        return
     if args.check_payments:
-        check_payments(
-            args.data_dir,
-            args.emails_csv or args.data_dir / "emails_contas_a_pagar.csv",
-        )
+        check_payments(args.data_dir, emails_csv)
         return
     source = input_file(args.data_dir)
     output = args.output or args.data_dir / "emails_contas_a_pagar.csv"
@@ -395,11 +591,22 @@ def main() -> None:
         )
         print(f"E-MAIL {email.number}: JSON extraído")
     output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(("company", "date", *FIELDS))
-        writer.writerows(rows)
-    print(f"{len(rows)} e-mails exportados para {output}")
+    file_descriptor, staged_name = tempfile.mkstemp(
+        prefix=f".{output.stem}.", suffix=".csv", dir=output.parent
+    )
+    os.close(file_descriptor)
+    staged_output = Path(staged_name)
+    try:
+        with staged_output.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(("company", "date", *FIELDS))
+            writer.writerows(rows)
+        check_payments(args.data_dir, staged_output)
+        count = classify_emails(args.data_dir, staged_output)
+        os.replace(staged_output, output)
+    finally:
+        staged_output.unlink(missing_ok=True)
+    print(f"{count} e-mails extraídos, relacionados e classificados em {output}")
 
 
 if __name__ == "__main__":
