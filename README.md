@@ -95,4 +95,10 @@ Cada bloco iniciado por `--- E-MAIL n ---` corresponde a um e-mail. O programa l
 
 O programa envia cada e-mail separadamente para `gpt-6-luna`, sem histórico de e-mails anteriores, com saída JSON restrita aos quatro campos extraídos. `amount_due` usa ponto decimal e duas casas; `due_date` usa `AAAA-MM-DD`. IDs compostos somente por dígitos são gravados como texto sem zeros à esquerda: `088231` vira `88231`. IDs alfanuméricos são preservados. O modelo interpreta prazos em linguagem natural: para "5 dias após o recebimento", usa a data do cabeçalho como recebimento quando o e-mail não informa outra data e soma cinco dias corridos. A chave da API não é impressa nem gravada no CSV. Cada execução faz uma nova chamada por e-mail e pode gerar cobrança na API.
 
-Esta etapa organiza os e-mails; a conciliação com os débitos (`tipo=D`) do extrato 03 ainda não está implementada. A pasta `data/` está no `.gitignore`, inclusive o CSV gerado.
+Esta etapa organiza os e-mails para a busca inicial nos débitos (`tipo=D`) do extrato 03. A pasta `data/` está no `.gitignore`, inclusive o CSV gerado.
+
+### Procurar pagamentos no extrato 03
+
+Depois de gerar o CSV de e-mails, execute `python3 prototipo_contas_a_pagar.py --check-payments`. Esta etapa lê `data/emails_contas_a_pagar.csv` e o único `03*.csv` em `data/`, considera apenas linhas com `tipo=D` e envia à API somente a empresa, o tipo e o ID do documento junto aos números das linhas e textos de `historico` desses débitos. Para usar outro CSV de e-mails, passe `--emails-csv "/caminho/emails.csv"`.
+
+E-mails com a mesma empresa e ID de documento geram uma única chamada; se o tipo variar, os tipos são enviados juntos. Se o ID estiver ausente, cada linha é verificada separadamente. O terminal mostra a linha correspondente do arquivo 03 para cada consulta, deixa `linha=` vazia quando não há correspondência e informa o total de chamadas desta etapa. A numeração é a linha física do CSV, incluindo o cabeçalho como linha 1. Esta verificação usa apenas o texto de `historico`; ainda não compara valores, datas ou confirma a liquidação financeira.
