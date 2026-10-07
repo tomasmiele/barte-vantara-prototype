@@ -68,7 +68,7 @@ O programa imprime uma seção para cada categoria, com a quantidade entre parê
 - `PAGAMENTO NÃO LOCALIZADO`: título sem correspondência aceita no extrato.
 - `POSSÍVEL PAGAMENTO EM DIA`, `POSSÍVEL PAGAMENTO ATRASADO` e `POSSÍVEL PAGAMENTO INCOMPLETO`: correspondência feita somente pelo valor, que exige conferência humana. No caso incompleto, a linha mostra o valor faltante.
 
-Uma data igual ao vencimento conta como pagamento em dia. As referências `01:13` e `02:4`, por exemplo, indicam o arquivo de origem e o número da linha no CSV. `linha do extrato=13` aponta para a linha do arquivo 03. O `nosso_numero` é exibido sem zeros à esquerda. Quando uma linha reúne títulos distintos, como `01:8 + 02:4`, **a contagem da categoria inclui os dois títulos**, mesmo que só uma linha seja impressa.
+Uma data igual ao vencimento conta como pagamento em dia. As referências `01:13` e `02:4`, por exemplo, indicam o arquivo de origem e o número da linha no CSV. `linha do extrato=13` aponta para a linha do arquivo 03. O `nosso_numero` é exibido sem zeros à esquerda. Uma linha como `01:10 + 02:2` representa o mesmo título encontrado nos dois arquivos e conta uma vez. Títulos com valores diferentes, como `01:8` e `02:4`, aparecem separadamente.
 
 Com o pacote de julho de 2026, um trecho da saída esperada é:
 
@@ -80,7 +80,7 @@ PAGAMENTO MAIOR ATRASADO (1)
 ## Regras e limitações atuais
 
 - O protótipo trabalha apenas com os arquivos 01, 02 e 03. No extrato, considera somente lançamentos com `tipo=C` (crédito).
-- Primeiro consolida títulos repetidos entre 01 e 02 quando **CNPJ, vencimento e valor** coincidem. Títulos com o mesmo CNPJ e vencimento, mas valores diferentes, podem ser agrupados; o valor esperado do grupo é a soma dos títulos.
+- Primeiro consolida títulos repetidos entre 01 e 02 quando **CNPJ, vencimento e valor** coincidem. Títulos com o mesmo CNPJ e vencimento, mas valores diferentes, são classificados separadamente.
 - Procura correspondências por `nosso_numero` de 01 contra `documento` de 03, depois por nome do cliente em `historico` e por CNPJ em `historico`. O CNPJ é normalizado para 14 dígitos. A comparação de `nosso_numero` com `documento` exige o mesmo texto no CSV, inclusive zeros à esquerda; a remoção dos zeros vale só para a apresentação.
 - A busca por nome usa palavras normalizadas e exige duas palavras adjacentes em comum. Abreviações ou grafias muito diferentes podem não ser reconhecidas.
 - A busca final apenas por valor é conservadora: considera correspondências únicas de valor igual ou parcial entre créditos sem identificação e títulos ainda não encontrados. Ela não comprova a identidade do pagador e não cobre todos os casos ambíguos ou de valor excedente.

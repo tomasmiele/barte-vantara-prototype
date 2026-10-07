@@ -1,7 +1,7 @@
 """Concilia títulos dos arquivos 01/02 com créditos do extrato 03.
 
 Consolida títulos repetidos em 01/02 por CNPJ, vencimento e valor.
-Títulos distintos do mesmo CNPJ e vencimento são classificados em conjunto.
+Títulos com valores diferentes são classificados separadamente.
 Depois usa nosso_numero, nome e CNPJ/tax_id para procurar créditos no extrato.
 Uma última busca por valor gera apenas pagamentos possíveis.
 Os arquivos de entrada são abertos apenas para leitura.
@@ -238,35 +238,13 @@ def reconcile(
     for index in active_indices:
         if tax_ids[index]:
             same_company_due[(tax_ids[index], due_dates[index])].append(index)
-    distinct_cross_groups: dict[tuple[str, date], list[int]] = {}
-    for (tax_id, due), indices in same_company_due.items():
-        source_refs = [
-            reference for index in indices for reference in references[index]
-        ]
-        if (
-            any(reference.startswith("01:") for reference in source_refs)
-            and any(reference.startswith("02:") for reference in source_refs)
-            and len({expected_values[index] for index in indices}) > 1
-        ):
-            distinct_cross_groups[(tax_id, due)] = indices
-
-    def group_label(indices: list[int]) -> str:
-        expected = sum((expected_values[index] for index in indices), Decimal("0.00"))
-        due = due_dates[indices[0]]
-        source_refs = [
-            reference for index in indices for reference in references[index]
-        ]
-        return (
-            f"{' + '.join(source_refs)} | cnpj={tax_ids[indices[0]]} "
-            f"| valor={brl(expected)} | vencimento={due:%d/%m/%Y}"
-        )
 
     def classify(
         indices: list[int], matches: list[tuple[Row, Decimal]], methods: list[str]
     ) -> None:
         expected = sum((expected_values[index] for index in indices), Decimal("0.00"))
         due = due_dates[indices[0]]
-        label = labels[indices[0]] if len(indices) == 1 else group_label(indices)
+        label = labels[indices[0]]
         paid = sum((amount for _, amount in matches), Decimal("0.00"))
         last_payment = max(parse_date(item.fields["data"]) for item, _ in matches)
         bank_lines = ", ".join(dict.fromkeys(str(item.line) for item, _ in matches))
@@ -324,30 +302,6 @@ def reconcile(
         if not matched:
             unresolved.append(index)
             continue
-        group = distinct_cross_groups.get((tax_ids[index], due_dates[index]), [])
-        if len(matched) == 1 and len(group) > 1:
-            combined = sum(
-                (expected_values[sibling] for sibling in group), Decimal("0.00")
-            )
-            other_keyed_credits = any(
-                credits.get(sources[sibling].fields.get("nosso_numero", ""))
-                for sibling in group
-                if sibling != index
-            )
-            if (
-                money(matched[0].fields["valor"]) == combined
-                and not other_keyed_credits
-                and all(sibling not in classified_by_key for sibling in group)
-            ):
-                for sibling in group:
-                    record_match(
-                        sibling,
-                        [(matched[0], expected_values[sibling])],
-                        "nosso_numero + grupo CNPJ/vencimento",
-                    )
-                classified_by_key.update(group)
-                used_bank_lines.add(matched[0].line)
-                continue
         record_match(
             index,
             [(item, money(item.fields["valor"])) for item in matched],
@@ -373,8 +327,8 @@ def reconcile(
                 for alias in name_aliases[index]
             )
         }
-        # Different-value titles with the same CNPJ and due date remain
-        # separate, but may share one bank deposit equal to their sum.
+        # Keep titles separate while sharing name candidates for the same
+        # company and due date, including alternate names in 01 and 02.
         candidates = set(direct)
         for index in direct:
             if tax_ids[index]:
@@ -461,19 +415,9 @@ def reconcile(
         if tax_allocations[index]:
             record_match(index, tax_allocations[index], "cnpj/tax_id")
 
-    grouped_indices = {
-        index for indices in distinct_cross_groups.values() for index in indices
-    }
     possible_units = [
-        tuple(indices)
-        for indices in distinct_cross_groups.values()
-        if all(not matched_payments[index] for index in indices)
+        (index,) for index in active_indices if not matched_payments[index]
     ]
-    possible_units.extend(
-        (index,)
-        for index in active_indices
-        if index not in grouped_indices and not matched_payments[index]
-    )
 
     # Value alone is weak evidence. Exclude credits that identify another
     # known customer or already carry a document number.
@@ -503,7 +447,7 @@ def reconcile(
         received = money(credit.fields["valor"])
         due = due_dates[unit[0]]
         payment_date = parse_date(credit.fields["data"])
-        label = labels[unit[0]] if len(unit) == 1 else group_label(list(unit))
+        label = labels[unit[0]]
         detail = (
             f"{label} | recebido={brl(received)} | data={payment_date:%d/%m/%Y} "
             f"| linha do extrato={credit.line} | critério=valor"
@@ -558,22 +502,8 @@ def reconcile(
         if len(competing_units) == 1:
             record_possible(unit, credit)
 
-    grouped_indices = set()
-    for indices in distinct_cross_groups.values():
-        if tuple(indices) in possible_matched:
-            grouped_indices.update(indices)
-            continue
-        matches = [match for index in indices for match in matched_payments[index]]
-        methods = [method for index in indices for method in match_methods[index]]
-        if matches:
-            classify(indices, matches, methods)
-        else:
-            results["PAGAMENTO NÃO LOCALIZADO"].append(group_label(indices))
-            category_counts["PAGAMENTO NÃO LOCALIZADO"] += len(indices)
-        grouped_indices.update(indices)
-
     for index in active_indices:
-        if index in grouped_indices or (index,) in possible_matched:
+        if (index,) in possible_matched:
             continue
         if matched_payments[index]:
             classify([index], matched_payments[index], match_methods[index])
@@ -605,7 +535,7 @@ def main() -> None:
         parser.exit(1, f"Erro: {exc}\n")
     print(
         "01/02: mesmo CNPJ, vencimento e valor = um título; "
-        "mesmo CNPJ/vencimento com valores diferentes = grupo."
+        "valores diferentes = títulos separados."
     )
     print(
         "03: nosso_numero = documento; depois cliente ou CNPJ/tax_id em historico. "
