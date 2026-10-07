@@ -1,6 +1,6 @@
 # Protótipo de contas a receber
 
-Este projeto compara os títulos dos arquivos **01** e **02** com os créditos do extrato **03**. Ele mostra no terminal quais pagamentos foram localizados, se chegaram até o vencimento e se o valor recebido foi igual, menor ou maior que o valor do título. Os arquivos de entrada são apenas lidos; a execução não altera os CSVs.
+Este projeto compara os títulos dos arquivos **01** e **02** com os créditos do extrato **03**. Ele mostra no terminal quais pagamentos foram localizados, se chegaram até o vencimento e se o valor recebido foi igual, menor ou maior que o valor do título. Também grava o resultado em CSV. Os arquivos de entrada são apenas lidos; a execução não altera os CSVs originais.
 
 ## O que é necessário
 
@@ -56,7 +56,9 @@ Por padrão, o programa lê a pasta `data/` ao lado do script. Para usar outra p
 python3 prototipo_contas_a_receber.py --data-dir "/caminho/para/o/data-pack"
 ```
 
-No Windows, substitua `python3` por `py -3` e use o caminho da pasta no seu computador. O programa **não** cria arquivos de saída: o relatório aparece no mesmo terminal em que o comando foi executado. Se faltar algum CSV ou coluna obrigatória, ele mostra uma mensagem de erro nesse terminal.
+No Windows, substitua `python3` por `py -3` e use o caminho da pasta no seu computador. O relatório aparece no terminal e em `data/resultado_contas_a_receber.csv`. Para escolher outro destino, passe `--output "/caminho/resultado.csv"`. O programa substitui apenas o CSV de resultado em execuções seguintes; os arquivos 01, 02 e 03 não podem ser usados como destino. Se faltar algum CSV ou coluna obrigatória, ele mostra uma mensagem de erro no terminal.
+
+O CSV tem uma linha por título classificado, inclusive os não localizados e os possíveis pagamentos. As colunas incluem `categoria`, `referencias`, `cliente`, `cnpj`, `nosso_numero`, `valor_titulo`, `vencimento`, `valor_recebido`, `data_pagamento`, `linhas_extrato`, `criterio`, `valor_faltante`, `valor_excedente`, `observacao` e `detalhes`. Os valores numéricos usam ponto decimal, as datas usam `AAAA-MM-DD` e os campos de pagamento ficam vazios quando não há crédito localizado. O arquivo usa UTF-8 com BOM e ponto e vírgula como separador para facilitar a abertura em planilhas. A pasta `data/`, incluindo esse resultado, não é versionada pelo Git.
 
 ## Como ler a saída
 
@@ -85,7 +87,7 @@ PAGAMENTO MAIOR ATRASADO (1)
 - A busca por nome usa palavras normalizadas e exige duas palavras adjacentes em comum. Abreviações ou grafias muito diferentes podem não ser reconhecidas.
 - A busca final apenas por valor é conservadora: considera correspondências únicas de valor igual ou parcial entre créditos sem identificação e títulos ainda não encontrados. Ela não comprova a identidade do pagador e não cobre todos os casos ambíguos ou de valor excedente.
 - Para pagamentos com mais de um crédito associado, a classificação de prazo usa a **data do último crédito**. Valores recebidos a menor ou a maior são mostrados sem ajuste automático, cobrança ou devolução.
-- O programa não oferece interface gráfica, API, integração bancária nem exportação do relatório. Revisão humana continua necessária, especialmente para os `POSSÍVEL PAGAMENTO` e títulos não localizados.
+- O programa não oferece interface gráfica, API nem integração bancária. Revisão humana continua necessária, especialmente para os `POSSÍVEL PAGAMENTO` e títulos não localizados.
 
 ## Protótipo de contas a pagar: preparação dos e-mails
 

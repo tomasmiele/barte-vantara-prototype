@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
+import tempfile
 import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Callable
@@ -27,6 +29,25 @@ class Row:
     source: str
     line: int
     fields: dict[str, str]
+
+
+CSV_COLUMNS = (
+    "categoria",
+    "referencias",
+    "cliente",
+    "cnpj",
+    "nosso_numero",
+    "valor_titulo",
+    "vencimento",
+    "valor_recebido",
+    "data_pagamento",
+    "linhas_extrato",
+    "criterio",
+    "valor_faltante",
+    "valor_excedente",
+    "observacao",
+    "detalhes",
+)
 
 
 def csv_rows(path: Path) -> list[Row]:
@@ -154,7 +175,9 @@ def tax_id_in_history(tax_id: str, history: str) -> bool:
 
 
 def reconcile(
-    directory: Path, category_counts: Counter[str] | None = None
+    directory: Path,
+    category_counts: Counter[str] | None = None,
+    export_rows: list[dict[str, str]] | None = None,
 ) -> dict[str, list[str]]:
     if category_counts is None:
         category_counts = Counter()
@@ -239,6 +262,44 @@ def reconcile(
         if tax_ids[index]:
             same_company_due[(tax_ids[index], due_dates[index])].append(index)
 
+    def add_result(
+        category: str,
+        index: int,
+        detail: str,
+        *,
+        received: Decimal | None = None,
+        payment_date: date | None = None,
+        bank_lines: str = "",
+        method: str = "",
+        missing: Decimal | None = None,
+        excess: Decimal | None = None,
+        note: str = "",
+    ) -> None:
+        results[category].append(detail)
+        category_counts[category] += 1
+        if export_rows is None:
+            return
+        number = sources[index].fields.get("nosso_numero", "")
+        export_rows.append(
+            {
+                "categoria": category,
+                "referencias": " + ".join(references[index]),
+                "cliente": names[index],
+                "cnpj": tax_ids[index],
+                "nosso_numero": (number.lstrip("0") or "0") if number else "",
+                "valor_titulo": str(expected_values[index]),
+                "vencimento": due_dates[index].isoformat(),
+                "valor_recebido": str(received) if received is not None else "",
+                "data_pagamento": payment_date.isoformat() if payment_date else "",
+                "linhas_extrato": bank_lines,
+                "criterio": method,
+                "valor_faltante": str(missing) if missing is not None else "",
+                "valor_excedente": str(excess) if excess is not None else "",
+                "observacao": note,
+                "detalhes": detail,
+            }
+        )
+
     def classify(
         indices: list[int], matches: list[tuple[Row, Decimal]], methods: list[str]
     ) -> None:
@@ -257,10 +318,15 @@ def reconcile(
             detail += f" | cliente={names[indices[0]]}"
         if len(indices) == 1 and "cnpj/tax_id" in methods:
             detail += f" | cnpj={tax_ids[indices[0]]}"
+        missing = None
+        excess = None
+        note = ""
         if paid < expected:
             category = "PAGAMENTO INCOMPLETO"
+            missing = expected - paid
+            note = "crédito após vencimento" if last_payment > due else ""
             description = f"{detail} | faltam={brl(expected - paid)}" + (
-                " | crédito após vencimento" if last_payment > due else ""
+                f" | {note}" if note else ""
             )
         elif paid > expected:
             category = (
@@ -268,6 +334,7 @@ def reconcile(
                 if last_payment > due
                 else "PAGAMENTO MAIOR EM DIA"
             )
+            excess = paid - expected
             description = f"{detail} | excedente={brl(paid - expected)}"
         elif last_payment > due:
             category = "PAGAMENTO ATRASADO"
@@ -275,8 +342,18 @@ def reconcile(
         else:
             category = "PAGAMENTO EM DIA"
             description = detail
-        results[category].append(description)
-        category_counts[category] += len(indices)
+        add_result(
+            category,
+            indices[0],
+            description,
+            received=paid,
+            payment_date=last_payment,
+            bank_lines=bank_lines,
+            method=method,
+            missing=missing,
+            excess=excess,
+            note=note,
+        )
 
     unresolved: list[int] = []
     used_bank_lines: set[int] = set()
@@ -452,17 +529,30 @@ def reconcile(
             f"{label} | recebido={brl(received)} | data={payment_date:%d/%m/%Y} "
             f"| linha do extrato={credit.line} | critério=valor"
         )
+        missing = None
+        note = ""
         if received < expected:
             category = "POSSÍVEL PAGAMENTO INCOMPLETO"
-            detail += f" | faltam={brl(expected - received)}"
+            missing = expected - received
+            detail += f" | faltam={brl(missing)}"
             if payment_date > due:
-                detail += " | crédito após vencimento"
+                note = "crédito após vencimento"
+                detail += f" | {note}"
         elif payment_date > due:
             category = "POSSÍVEL PAGAMENTO ATRASADO"
         else:
             category = "POSSÍVEL PAGAMENTO EM DIA"
-        results[category].append(detail)
-        category_counts[category] += len(unit)
+        add_result(
+            category,
+            unit[0],
+            detail,
+            received=received,
+            payment_date=payment_date,
+            bank_lines=str(credit.line),
+            method="valor",
+            missing=missing,
+            note=note,
+        )
         possible_matched.add(unit)
         possible_used_lines.add(credit.line)
 
@@ -508,14 +598,49 @@ def reconcile(
         if matched_payments[index]:
             classify([index], matched_payments[index], match_methods[index])
         else:
-            results["PAGAMENTO NÃO LOCALIZADO"].append(labels[index])
-            category_counts["PAGAMENTO NÃO LOCALIZADO"] += 1
+            add_result("PAGAMENTO NÃO LOCALIZADO", index, labels[index])
     return results
+
+
+def write_results_csv(
+    path: Path, rows: list[dict[str, str]], categories: tuple[str, ...]
+) -> None:
+    unknown = {row["categoria"] for row in rows} - set(categories)
+    if unknown:
+        raise ValueError(f"Categorias sem seção de saída: {', '.join(sorted(unknown))}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8-sig",
+            newline="",
+            prefix=f".{path.stem}.",
+            suffix=".csv",
+            dir=path.parent,
+            delete=False,
+        ) as handle:
+            staged_path = Path(handle.name)
+            writer = csv.DictWriter(
+                handle, fieldnames=CSV_COLUMNS, delimiter=";", lineterminator="\n"
+            )
+            writer.writeheader()
+            for category in categories:
+                writer.writerows(row for row in rows if row["categoria"] == category)
+        os.replace(staged_path, path)
+    finally:
+        if staged_path is not None:
+            staged_path.unlink(missing_ok=True)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=Path(__file__).parent / "data")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="CSV de saída (padrão: data/resultado_contas_a_receber.csv)",
+    )
     args = parser.parse_args()
     categories = (
         "PAGAMENTO NÃO LOCALIZADO",
@@ -529,8 +654,22 @@ def main() -> None:
         "POSSÍVEL PAGAMENTO INCOMPLETO",
     )
     category_counts: Counter[str] = Counter()
+    export_rows: list[dict[str, str]] = []
+    output = args.output or args.data_dir / "resultado_contas_a_receber.csv"
     try:
-        results = reconcile(args.data_dir, category_counts)
+        results = reconcile(args.data_dir, category_counts, export_rows)
+        source_paths = {
+            input_file(args.data_dir, prefix).resolve() for prefix in ("01", "02", "03")
+        }
+        if output.resolve() in source_paths:
+            raise ValueError(
+                "O CSV de saída não pode substituir os arquivos 01, 02 ou 03"
+            )
+        if output.parent.resolve() == args.data_dir.resolve() and re.match(
+            r"^(01|02|03).*\.csv$", output.name, re.IGNORECASE
+        ):
+            raise ValueError("O nome do CSV de saída não pode começar com 01, 02 ou 03")
+        write_results_csv(output, export_rows, categories)
     except (OSError, ValueError) as exc:
         parser.exit(1, f"Erro: {exc}\n")
     print(
@@ -547,6 +686,7 @@ def main() -> None:
         print(f"\n{category} ({category_counts[category]})")
         for item in items:
             print(f"  - {item}")
+    print(f"\nCSV salvo em: {output}")
 
 
 if __name__ == "__main__":
